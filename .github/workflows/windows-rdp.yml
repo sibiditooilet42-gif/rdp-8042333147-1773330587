@@ -1,0 +1,91 @@
+name: Windows RDP
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 190
+
+    steps:
+      - name: Enable Remote Desktop
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Restart-Service -Name TermService -Force
+
+      - name: Rename Computer
+        shell: powershell
+        run: |
+          Rename-Computer -NewName "AI-STV" -Force
+
+      - name: Create RDP User
+        shell: powershell
+        run: |
+          $rdpUser = "UserSPIPCY"
+          $rdpPass = "mOJtpzHRJ102oX"
+          $securePass = ConvertTo-SecureString $rdpPass -AsPlainText -Force
+          if (Get-LocalUser -Name $rdpUser -ErrorAction SilentlyContinue) { Remove-LocalUser -Name $rdpUser }
+          New-LocalUser -Name $rdpUser -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member $rdpUser
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $rdpUser
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $file = "$env:TEMP\tailscale.msi"
+          $success = $false
+          for ($try = 1; $try -le 3 -and -not $success; $try++) {
+            try {
+              Invoke-WebRequest $url -OutFile $file -UseBasicParsing -TimeoutSec 60
+              if ((Test-Path $file) -and (Get-Item $file).Length -gt 1MB) {
+                Start-Process msiexec.exe -ArgumentList "/i `"$file`" /quiet /norestart" -Wait
+                $success = $true
+              }
+            } catch {
+              Write-Host "Attempt $try failed, retrying..."
+              Start-Sleep -Seconds 5
+            }
+          }
+          if (-not $success) { exit 1 }
+
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $tsExe up --authkey="$env:TAILSCALE_AUTH_KEY" --hostname="github-rdp-${{ github.run_id }}" --accept-routes
+          for ($i = 0; $i -lt 18; $i++) {
+            Start-Sleep -Seconds 5
+            $ip = (& $tsExe ip -4 2>$null) -replace '\s',''
+            if ($ip -match '^\d+\.\d+\.\d+\.\d+$') {
+              Write-Host "Tailscale connected: $ip"
+              break
+            }
+            Write-Host "Waiting... ($i)"
+          }
+
+      - name: Report IP
+        shell: powershell
+        run: |
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $ip = (& $tsExe ip -4 2>$null) -replace '\s',''
+          Write-Host "TAILSCALE_IP=$ip"
+          echo $ip | Out-File -FilePath "$env:GITHUB_WORKSPACE\tailscale_ip.txt" -Encoding utf8
+
+      - name: Upload IP Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-ip
+          path: tailscale_ip.txt
+          retention-days: 1
+
+      - name: Keep Session Alive
+        shell: powershell
+        run: |
+          Write-Host "Session active for 180 minutes..."
+          Start-Sleep -Seconds 10800
